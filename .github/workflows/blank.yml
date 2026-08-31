@@ -1,10 +1,10 @@
 # .github/workflows/atualizar_dados.yml
-name: Atualizar dados meteorológicos
+name: Atualizar dados meteorológicos (via proxy BR)
 
 on:
   schedule:
-    - cron: '0 6 * * *'          # todos os dias às 6:00 UTC
-  workflow_dispatch:               # permite execução manual
+    - cron: '0 10 * * *'          # todos os dias às 10:00 UTC
+  workflow_dispatch:
 
 jobs:
   update-data:
@@ -25,23 +25,66 @@ jobs:
       - name: Instalar dependências do sistema
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev \
+                                  curl jq netcat-openbsd
 
       - name: Instalar pacotes R
         run: |
           Rscript -e "install.packages('pacman', repos = 'https://cloud.r-project.org')"
           Rscript -e "pacman::p_load(httr, tidyverse, jsonlite, vroom, usethis, logger, curl, rlang, purrr, dplyr, tidyr, readr, tibble)"
 
-      - name: Criar e executar script R
+      - name: Obter proxy brasileiro gratuito
+        id: get_proxy
+        run: |
+          # Baixa lista de proxies HTTP/HTTPS do Brasil (fonte: proxyscrape)
+          curl -s "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&country=BR&timeout=10000" > proxies_br.txt
+          
+          # Testa cada proxy até encontrar um que responda
+          PROXY=""
+          while IFS= read -r proxy; do
+            echo "Testando $proxy..."
+            # Testa conectividade e tempo de resposta (máx 5s)
+            if nc -zv -w 5 $(echo $proxy | cut -d: -f1) $(echo $proxy | cut -d: -f2) 2>/dev/null; then
+              PROXY="$proxy"
+              echo "Proxy funcionando: $PROXY"
+              break
+            fi
+          done < proxies_br.txt
+          
+          if [ -z "$PROXY" ]; then
+            echo "Nenhum proxy BR encontrado. Usando fallback (proxy público genérico)."
+            PROXY="br-proxy.example.com:8080"  # fallback opcional
+          fi
+          
+          # Exporta para variáveis de ambiente do workflow
+          echo "PROXY_HTTP=http://$PROXY" >> $GITHUB_ENV
+          echo "PROXY_HTTPS=http://$PROXY" >> $GITHUB_ENV
+          echo "PROXY_SOCKS=socks5://$PROXY" >> $GITHUB_ENV  # se necessário
+
+      - name: Criar e executar script R (com proxy configurado)
         env:
           # Use um secret para a chave (recomendado)
           # BNDMET_API_KEY: ${{ secrets.BNDMET_API_KEY }}
           TZ: America/Sao_Paulo
+          # As variáveis de proxy serão herdadas do step anterior
         run: |
           cat << 'EOF' > script.R
-          pacman::p_load(httr, tidyverse, jsonlite, vroom, usethis, logger)
+          pacman::p_load(httr, tidyverse, jsonlite, vroom, usethis, logger, curl)
 
-          # Conteúdo do arquivo estacoes_rj.csv embutido
+          # Lê variáveis de ambiente do proxy (definidas no workflow)
+          proxy_http <- Sys.getenv("PROXY_HTTP", NA)
+          proxy_https <- Sys.getenv("PROXY_HTTPS", NA)
+
+          # Configura proxy global para o pacote httr
+          if (!is.na(proxy_http)) {
+            Sys.setenv(http_proxy = proxy_http)
+            Sys.setenv(https_proxy = proxy_https)
+            message("Usando proxy: ", proxy_http)
+          } else {
+            message("Nenhum proxy definido, usando conexão direta.")
+          }
+
+          # --- Dados do CSV embutido (mesmo conteúdo anterior) ---
           estacoes_csv <- "localidades2,DC_NOME,SG_ESTADO,CD_SITUACAO,VL_LATITUDE,VL_LONGITUDE,VL_ALTITUDE,DT_INICIO_OPERACAO,CD_ESTACAO,x_,y_,tipo_
           ANGRA DOS,ANGRA DOS REIS,RJ,Operante,-22.97555554,-44.30333333,6,24/08/2017,A628,571409.545,7459016.760,auto
           ARRAIAL D,ARRAIAL DO CABO,RJ,Operante,-22.97527777,-42.02138888,5,21/09/2006,A606,805404.484,7456116.417,auto
@@ -80,20 +123,17 @@ jobs:
           SANTO ANTONIO PADUA,SANTO ANTONIO DE PADUA,RJ,Operante,-21.53694444,-42.16083333,95,31/03/1924,\"83805\",794091.565,7615748.955,conv
           TERESOPOLIS_0,TERESOPOLIS,RJ,Operante,-22.41722221,-42.97222221,874.2,31/12/1912,\"83744\",708722.265,7519582.305,conv"
 
-          # Lê o CSV diretamente da string
           estacoes <- readr::read_delim(I(estacoes_csv), delim = ",", show_col_types = FALSE) |>
             dplyr::filter(CD_SITUACAO == "Operante", tipo_ == "auto") |>
             rlang::set_names("localidades", "nome_estacao", "nome_estado", "situacao",
                              "latitude","longitude", "altitude", "dt_inicio_operacao",
                              "cod_estacao","x_","y_", "tipo")
 
-          # Função para buscar dados da API
           pega_dados_inmet <- function(estacao, indicador, data_inicio, data_fim) {
 
             data_inicio <- as.Date(data_inicio) |> format("%Y-%m-%d")
             data_fim    <- as.Date(data_fim) |> format("%Y-%m-%d")
 
-            # Usa variável de ambiente se definida, senão usa a chave fixa
             apikey <- Sys.getenv("BNDMET_API_KEY", "1hS5CJHPSCOCSh4W5b57aZHqBBjmSuDy")
 
             requisicao <- paste0(
@@ -105,6 +145,7 @@ jobs:
               "&dataFinal=", data_fim
             )
 
+            # Usa o proxy configurado via variáveis de ambiente
             h <- curl::new_handle()
             curl::handle_setheaders(
               h,
@@ -113,6 +154,7 @@ jobs:
             )
             curl::handle_setopt(h, connecttimeout = 600)
 
+            # Se houver proxy, o curl respeita as variáveis http_proxy/https_proxy
             resposta <- curl::curl_fetch_memory(url = requisicao, handle = h)
 
             if (resposta$status_code != 200) {
@@ -174,7 +216,6 @@ jobs:
             }
           }
 
-          # Obtém dados dos últimos 15 dias
           base_temp <- purrr::pmap(
             tidyr::expand_grid(
               estacao = estacoes$cod_estacao,
@@ -187,7 +228,6 @@ jobs:
           ) |>
             dplyr::bind_rows()
 
-          # Salva CSV
           vroom::vroom_write(
             base_temp,
             file = "base_temp.csv",
@@ -195,7 +235,7 @@ jobs:
           )
           EOF
 
-          # Executa o script
+          # Executa o script com as variáveis de proxy já no ambiente
           Rscript script.R
 
       - name: Configurar usuário git
