@@ -25,45 +25,72 @@ jobs:
       - name: Instalar dependências do sistema
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev curl
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev curl jq
 
       - name: Instalar pacotes R
         run: |
           Rscript -e "install.packages('pacman', repos = 'https://cloud.r-project.org')"
           Rscript -e "pacman::p_load(httr, tidyverse, jsonlite, vroom, usethis, logger, curl, rlang, purrr, dplyr, tidyr, readr, tibble)"
 
-      - name: Buscar proxy brasileiro (se disponível)
+      - name: Buscar proxy brasileiro funcional (múltiplas fontes)
         id: proxy
         run: |
-          # Baixa lista de proxies HTTP do Brasil
-          curl -s "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&country=BR&timeout=10000" > proxies_br.txt
+          # Lista de fontes de proxies HTTP/HTTPS
+          SOURCES=(
+            "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&country=BR&timeout=10000"
+            "https://www.proxy-list.download/api/v1/get?type=http&country=BR"
+            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"
+            "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt"
+          )
 
-          # Fallback para outra fonte se a primeira estiver vazia
-          if [ ! -s proxies_br.txt ]; then
-            curl -s "https://www.proxy-list.download/api/v1/get?type=http&country=BR" > proxies_br.txt
-          fi
+          PROXY_LIST="/tmp/proxies.txt"
+          > "$PROXY_LIST"
+
+          for url in "${SOURCES[@]}"; do
+            echo "Baixando de $url"
+            curl -s "$url" >> "$PROXY_LIST"
+            echo "" >> "$PROXY_LIST"
+          done
+
+          # Filtra apenas proxies com IP do Brasil (muitos podem ser de outros países, mas vamos testar)
+          grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$' "$PROXY_LIST" | sort -u > /tmp/proxies_clean.txt
 
           PROXY=""
-          while IFS= read -r proxy; do
+          # Testa até 20 proxies
+          head -20 /tmp/proxies_clean.txt | while IFS= read -r proxy; do
             echo "Testando $proxy..."
-            # Testa com curl e timeout curto
-            if curl -s -x "http://$proxy" --max-time 5 "http://httpbin.org/ip" > /dev/null; then
-              PROXY="$proxy"
-              echo "Proxy válido encontrado: $PROXY"
-              break
+            # Testa com curl para httpbin e verifica se retorna IP BR (via whois ou geolocalização)
+            IP=$(curl -s -x "http://$proxy" --max-time 5 "http://httpbin.org/ip" 2>/dev/null | jq -r .origin)
+            if [ -n "$IP" ]; then
+              # Verifica se o IP é do Brasil (apenas teste simples: consulta geolocalização)
+              COUNTRY=$(curl -s "http://ip-api.com/json/$IP?fields=countryCode" | jq -r .countryCode)
+              if [ "$COUNTRY" == "BR" ]; then
+                PROXY="$proxy"
+                echo "Proxy BR válido encontrado: $PROXY (IP $IP)"
+                break
+              else
+                echo "Proxy $proxy retornou IP $IP (não é BR)"
+              fi
             fi
-          done < proxies_br.txt
+          done
 
-          # Exporta para o ambiente se encontrou
           if [ -n "$PROXY" ]; then
             echo "PROXY_URL=http://$PROXY" >> $GITHUB_ENV
             echo "Usando proxy: $PROXY"
           else
-            echo "Nenhum proxy BR funcional. Conexão direta será usada."
-            # Não define PROXY_URL, fica vazio
+            echo "Nenhum proxy BR funcional. Tentando ScraperAPI como fallback..."
+            # Fallback: ScraperAPI (gratuito até 1000 req/mês) – precisa de chave
+            # Se você tiver uma chave, defina como secret SCRAPERAPI_KEY
+            SCRAPER_KEY="${{ secrets.SCRAPERAPI_KEY }}"
+            if [ -n "$SCRAPER_KEY" ]; then
+              echo "SCRAPERAPI_KEY=$SCRAPER_KEY" >> $GITHUB_ENV
+              echo "Usando ScraperAPI como proxy."
+            else
+              echo "Sem proxy alternativo. Conexão direta será usada (pode falhar)."
+            fi
           fi
 
-      - name: Criar e executar script R
+      - name: Criar e executar script R (com proxy e headers)
         env:
           # BNDMET_API_KEY: ${{ secrets.BNDMET_API_KEY }}
           TZ: America/Sao_Paulo
@@ -71,17 +98,23 @@ jobs:
           cat << 'EOF' > script.R
           pacman::p_load(httr, tidyverse, jsonlite, vroom, usethis, logger, curl)
 
-          # Configura proxy SOMENTE SE a variável PROXY_URL estiver definida e não vazia
+          # --- Configuração de proxy (se disponível) ---
           proxy_url <- Sys.getenv("PROXY_URL")
+          scraper_key <- Sys.getenv("SCRAPERAPI_KEY")
+
           if (nzchar(proxy_url)) {
             Sys.setenv(http_proxy = proxy_url)
             Sys.setenv(https_proxy = proxy_url)
-            message("Usando proxy: ", proxy_url)
+            message("Usando proxy HTTP: ", proxy_url)
+          } else if (nzchar(scraper_key)) {
+            # ScraperAPI atua como proxy via URL
+            message("Usando ScraperAPI como proxy.")
+            # A variável será usada na construção da URL
           } else {
             message("Conexão direta (sem proxy).")
           }
 
-          # CSV embutido
+          # --- CSV embutido (mesmo conteúdo) ---
           estacoes_csv <- "localidades2,DC_NOME,SG_ESTADO,CD_SITUACAO,VL_LATITUDE,VL_LONGITUDE,VL_ALTITUDE,DT_INICIO_OPERACAO,CD_ESTACAO,x_,y_,tipo_
           ANGRA DOS,ANGRA DOS REIS,RJ,Operante,-22.97555554,-44.30333333,6,24/08/2017,A628,571409.545,7459016.760,auto
           ARRAIAL D,ARRAIAL DO CABO,RJ,Operante,-22.97527777,-42.02138888,5,21/09/2006,A606,805404.484,7456116.417,auto
@@ -126,6 +159,7 @@ jobs:
                              "latitude","longitude", "altitude", "dt_inicio_operacao",
                              "cod_estacao","x_","y_", "tipo")
 
+          # Função que faz a requisição com proxy e headers realistas
           pega_dados_inmet <- function(estacao, indicador, data_inicio, data_fim) {
 
             data_inicio <- as.Date(data_inicio) |> format("%Y-%m-%d")
@@ -133,32 +167,57 @@ jobs:
 
             apikey <- Sys.getenv("BNDMET_API_KEY", "1hS5CJHPSCOCSh4W5b57aZHqBBjmSuDy")
 
-            requisicao <- paste0(
-              "https://api-bndmet.decea.mil.br/v1/estacoes/",
-              estacao,
-              "/fenomenos/",
-              indicador,
-              "?dataInicio=", data_inicio,
-              "&dataFinal=", data_fim
-            )
+            # URL base
+            base_url <- "https://api-bndmet.decea.mil.br/v1/estacoes/"
+            # Se estiver usando ScraperAPI, modifica a URL
+            scraper_key <- Sys.getenv("SCRAPERAPI_KEY")
+            if (nzchar(scraper_key)) {
+              # ScraperAPI atua como proxy com prefixo
+              final_url <- paste0(
+                "https://api.scraperapi.com/?api_key=", scraper_key,
+                "&url=", URLencode(
+                  paste0(base_url, estacao, "/fenomenos/", indicador,
+                         "?dataInicio=", data_inicio, "&dataFinal=", data_fim)
+                )
+              )
+            } else {
+              final_url <- paste0(
+                base_url, estacao, "/fenomenos/", indicador,
+                "?dataInicio=", data_inicio, "&dataFinal=", data_fim
+              )
+            }
 
+            # Configura handle com headers para simular navegador
             h <- curl::new_handle()
             curl::handle_setheaders(
               h,
               "accept" = "application/json",
-              "x-api-key" = apikey
+              "x-api-key" = apikey,
+              "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+              "Accept-Language" = "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+              "Accept-Encoding" = "gzip, deflate, br",
+              "Cache-Control" = "no-cache",
+              "Pragma" = "no-cache"
             )
-            curl::handle_setopt(h, connecttimeout = 600)
+            curl::handle_setopt(
+              h,
+              connecttimeout = 600,
+              timeout = 600,
+              followlocation = TRUE,
+              ssl_verifypeer = FALSE  # apenas para evitar erros de certificado
+            )
 
-            resposta <- curl::curl_fetch_memory(url = requisicao, handle = h)
+            resposta <- curl::curl_fetch_memory(url = final_url, handle = h)
 
             if (resposta$status_code != 200) {
+              # Se erro, tenta ler o conteúdo
+              err_msg <- rawToChar(resposta$content)
               stop(
                 paste0(
                   "Erro na API BNDMET. HTTP ",
                   resposta$status_code,
                   "\n",
-                  rawToChar(resposta$content)
+                  substr(err_msg, 1, 500)  # limita o tamanho
                 )
               )
             }
