@@ -1,313 +1,64 @@
 # .github/workflows/atualizar_dados.yml
-name: Atualizar dados meteorológicos (proxy via R)
+name: Atualizar dados meteorológicos
 
 on:
+  # Agendamento diário (ajuste o horário conforme necessário)
   schedule:
-    - cron: '0 10 * * *'
+    - cron: '0 10 * * *'   # Executa todos os dias às 10:00 UTC
+  # Permite disparo manual pela interface do GitHub
   workflow_dispatch:
 
 jobs:
   update-data:
     runs-on: ubuntu-latest
-
+    
     steps:
       - name: Checkout do repositório
         uses: actions/checkout@v4
         with:
-          persist-credentials: false
+          persist-credentials: false  # Será redefinido para commit
 
       - name: Configurar R
         uses: r-lib/actions/setup-r@v2
         with:
-          r-version: '4.4.1'
+          r-version: '4.4.1'  # ou a versão que desejar
           use-public-rspm: true
 
-      - name: Instalar dependências do sistema
+      - name: Instalar dependências do sistema (se necessário)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev curl jq
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
 
       - name: Instalar pacotes R
         run: |
+          # Instala pacman primeiro para carregar os demais
           Rscript -e "install.packages('pacman', repos = 'https://cloud.r-project.org')"
           Rscript -e "pacman::p_load(httr, tidyverse, jsonlite, vroom, usethis, logger, curl, rlang, purrr, dplyr, tidyr, readr, tibble)"
+          # Se houver outros pacotes, adicione aqui
 
-      - name: Executar script R (com busca e fallback de proxy)
+      - name: Executar script R
         env:
-          BNDMET_API_KEY: ${{ secrets.BNDMET_API_KEY || '1hS5CJHPSCOCSh4W5b57aZHqBBjmSuDy' }}
+          # A API key está hardcoded no script, mas é recomendável usar secrets
+          # BNDMET_API_KEY: ${{ secrets.BNDMET_API_KEY }}
+          # Caso queira parametrizar, modifique o script para ler de variável de ambiente
           TZ: America/Sao_Paulo
         run: |
-          cat << 'EOF' > script.R
-          pacman::p_load(httr, tidyverse, jsonlite, vroom, usethis, logger, curl)
-
-          # --- Função para baixar lista de proxies de múltiplas fontes ---
-          get_proxy_list <- function() {
-            sources <- c(
-              "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&country=BR&timeout=5000",
-              "https://www.proxy-list.download/api/v1/get?type=http&country=BR",
-              "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-              "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt"
-            )
-            proxies <- character()
-            for (url in sources) {
-              message("Baixando lista de ", url)
-              tryCatch({
-                resp <- curl::curl_fetch_memory(url, handle = curl::new_handle(connecttimeout = 10))
-                if (resp$status_code == 200) {
-                  text <- rawToChar(resp$content)
-                  matches <- gregexpr("([0-9]{1,3}\\.){3}[0-9]{1,3}:[0-9]+", text)
-                  ips <- regmatches(text, matches)[[1]]
-                  proxies <- c(proxies, ips)
-                }
-              }, error = function(e) message("Erro ao baixar ", url, ": ", e$message))
-            }
-            unique(proxies)
-          }
-
-          # --- Função para testar um proxy com a API BNDMET (timeout 10s) ---
-          test_proxy <- function(proxy, api_key, timeout = 10) {
-            test_url <- "https://api-bndmet.decea.mil.br/v1/estacoes/A628/fenomenos/I101?dataInicio=2026-08-01&dataFinal=2026-08-15"
-            h <- curl::new_handle()
-            curl::handle_setheaders(h,
-              "accept" = "application/json",
-              "x-api-key" = api_key,
-              "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            )
-            curl::handle_setopt(h, connecttimeout = timeout, timeout = timeout,
-                                proxy = proxy, proxytype = 0)
-            tryCatch({
-              resp <- curl::curl_fetch_memory(test_url, handle = h)
-              if (resp$status_code == 200) {
-                return(TRUE)
-              } else {
-                return(FALSE)
-              }
-            }, error = function(e) {
-              return(FALSE)
-            })
-          }
-
-          # --- Busca um proxy funcional (limite de 100 testes) ---
-          find_working_proxy <- function(api_key) {
-            proxies <- get_proxy_list()
-            if (length(proxies) == 0) {
-              message("Nenhum proxy encontrado nas listas.")
-              return(NULL)
-            }
-            message("Testando até 100 proxies de um total de ", length(proxies), "...")
-            proxies_to_test <- head(proxies, 100)
-            for (proxy in proxies_to_test) {
-              message("Testando proxy: ", proxy)
-              if (test_proxy(proxy, api_key, timeout = 10)) {
-                message("Proxy válido: ", proxy)
-                return(proxy)
-              }
-            }
-            return(NULL)
-          }
-
-          # --- Configuração inicial ---
-          apikey <- Sys.getenv("BNDMET_API_KEY", "1hS5CJHPSCOCSh4W5b57aZHqBBjmSuDy")
-          scraper_key <- Sys.getenv("SCRAPERAPI_KEY")
-          proxy <- NULL
-
-          if (nzchar(scraper_key)) {
-            message("Usando ScraperAPI (configurado via secret).")
-          } else {
-            message("Buscando proxy público...")
-            proxy <- find_working_proxy(apikey)
-            if (!is.null(proxy)) {
-              message("Proxy selecionado: ", proxy)
-              Sys.setenv(http_proxy = paste0("http://", proxy))
-              Sys.setenv(https_proxy = paste0("http://", proxy))
-            } else {
-              message("Nenhum proxy funcional. Tentando conexão direta (pode falhar).")
-            }
-          }
-
-          # --- CSV embutido (completo) ---
-          estacoes_csv <- "localidades2,DC_NOME,SG_ESTADO,CD_SITUACAO,VL_LATITUDE,VL_LONGITUDE,VL_ALTITUDE,DT_INICIO_OPERACAO,CD_ESTACAO,x_,y_,tipo_
-          ANGRA DOS,ANGRA DOS REIS,RJ,Operante,-22.97555554,-44.30333333,6,24/08/2017,A628,571409.545,7459016.760,auto
-          ARRAIAL D,ARRAIAL DO CABO,RJ,Operante,-22.97527777,-42.02138888,5,21/09/2006,A606,805404.484,7456116.417,auto
-          CAMBUCI_0,CAMBUCI,RJ,Pane,-21.58749999,-41.95833333,46,19/11/2002,A604,814971.906,7609751.871,auto
-          CAMPOS DOS GOYTACAZES,CAMPOS DOS GOYTACAZES,RJ,Operante,-21.71472222,-41.34388889,17,24/09/2006,A607,878324.749,7594278.583,auto
-          CAMPOS DOS GOYTACAZES - SAO TOME,CAMPOS DOS GOYTACAZES - SAO TOME,RJ,Operante,-22.04166666,-41.05166666,7,12/06/2008,A620,907664.500,7557284.032,auto
-          CARMO,CARMO,RJ,Operante,-21.9386111,-42.60083333,293,10/10/2018,A629,747803.012,7572028.758,auto
-          DUQUE DE ,DUQUE DE CAXIAS - XEREM,RJ,Pane,-22.58972221,-43.28222221,22,20/10/2002,A603,676586.805,7500879.655,auto
-          XEREM_01-,DUQUE DE CAXIAS - XEREM,RJ,Pane,-22.58972221,-43.28222221,22,20/10/2002,A603,676586.805,7500879.655,auto
-          MACAE_01-,MACAE,RJ,Operante,-22.3761111,-41.81194444,28,21/09/2006,A608,828320.129,7522062.140,auto
-          NITEROI,NITEROI,RJ,Operante,-22.86749999,-43.10194444,6,12/07/2018,A627,694730.002,7469894.103,auto
-          NOVA FRIB,NOVA FRIBURGO - SALINAS,RJ,Operante,-22.33472221,-42.67694443,1070,17/09/2010,A624,739267.908,7528279.242,auto
-          PARATY,PARATY,RJ,Operante,-23.2236111,-44.72694443,3,18/11/2006,A619,527936.918,7431699.952,auto
-          PICO DO COUTO,PICO DO COUTO,RJ,Operante,-22.46472222,-43.29138888,1777,21/10/2006,A610,675802.458,7514731.505,auto
-          PATY DO A,Paty do Alferes - Avelar,RJ,Operante,-22.34722221,-43.41777777,508,09/11/2022,A637,662932.574,7527884.072,auto
-          RESENDE_0,RESENDE,RJ,Operante,-22.45138888,-44.44499999,438.83,28/09/2006,A609,557105.139,7517103.613,auto
-          RIO CLARO,RIO CLARO,RJ,Operante,-22.653579,-44.040916,516,02/06/2016,A626,598540.679,7494510.429,auto
-          FORTE DE COPACABANA - RIO DE JANEIRO,RIO DE JANEIRO - FORTE DE COPACABANA,RJ,Operante,-22.98833333,-43.19055555,25.59,17/05/2007,A652,685472.137,7456627.697,auto
-          JACAREPAGUA - RIO DE JANEIRO,RIO DE JANEIRO - JACAREPAGUA,RJ,Operante,-22.93999999,-43.40277777,20,09/08/2017,A636,663772.899,7462232.305,auto
-          VILA MILITAR - RIO DE JANEIRO,RIO DE JANEIRO - VILA MILITAR,RJ,Operante,-22.86138888,-43.41138888,30.43,12/04/2007,A621,662983.731,7470946.343,auto
-          MARAMBAIA - RIO DE JANEIRO,RIO DE JANEIRO-MARAMBAIA,RJ,Operante,-23.05027777,-43.59555555,12,07/11/2002,A602,643886.310,7450223.918,auto
-          SANTA MARIA MADALENA,SANTA MARIA MADALENA,RJ,Operante,-21.95055555,-42.01027777,586,15/10/2018,A630,808810.187,7569632.216,auto
-          SAQUAREMA,SAQUAREMA - SAMPAIO CORREIA,RJ,Operante,-22.8711111,-42.60888888,26,01/09/2015,A667,745326.799,7468757.716,auto
-          SEROPEDIC,SEROPEDICA-ECOLOGIA AGRICOLA,RJ,Operante,-22.75777777,-43.68472221,35,23/05/2000,A601,635039.353,7482694.100,auto
-          SILVA JAR,SILVA JARDIM,RJ,Operante,-22.64583333,-42.41555555,19,27/08/2015,A659,765607.562,7493377.939,auto
-          TERESOPOL,TERESOPOLIS-PARQUE NACIONAL,RJ,Operante,-22.4486111,-42.98694444,981,31/10/2006,A618,707159.813,7516126.672,auto
-          TRES RIOS,TRES RIOS,RJ,Operante,-22.09833333,-43.20833333,295,07/06/2016,A625,684831.323,7555201.446,auto
-          VALENCA_0,VALENCA,RJ,Operante,-22.35805555,-43.69555555,370,26/09/2006,A611,634313.537,7526958.788,auto
-          ALTO DA BOA VISTA,ALTO DA BOA VISTA,RJ,Operante,-22.96583333,-43.27916666,347.1,31/05/1966,\"83007\",676416.558,7459228.560,conv
-          CAMPOS,CAMPOS,RJ,Operante,-21.74249999,-41.33277777,11.2,16/06/1911,\"83698\",879402.582,7591172.217,conv
-          CORDEIRO,CORDEIRO,RJ,Operante,-22.02222221,-42.36444444,505.9,15/07/1971,\"83718\",772071.308,7562365.853,conv
-          ITAPERUNA,ITAPERUNA,RJ,Operante,-21.20444444,-41.90555555,123.6,31/12/1921,\"83695\",821278.084,7652085.524,conv
-          ITATIAIA_,ITATIAIA,RJ,Pane,-22.325541632523834,-44.532508635571475,,,A635,548144.3,7531065,conv
-          RESENDE,RESENDE,RJ,Operante,-22.45111111,-44.44472221,439.9,21/05/1944,\"83738\",557133.835,7517134.255,conv
-          SANTA MARIA MADALENA_0,SANTA MARIA MADALENA,RJ,Operante,-21.96805554,-42.00305555,640,20/12/1921,\"83696\",809518.707,7567678.708,conv
-          SANTO ANTONIO PADUA,SANTO ANTONIO DE PADUA,RJ,Operante,-21.53694444,-42.16083333,95,31/03/1924,\"83805\",794091.565,7615748.955,conv
-          TERESOPOLIS_0,TERESOPOLIS,RJ,Operante,-22.41722221,-42.97222221,874.2,31/12/1912,\"83744\",708722.265,7519582.305,conv"
-
-          estacoes <- readr::read_delim(I(estacoes_csv), delim = ",", show_col_types = FALSE) |>
-            dplyr::filter(CD_SITUACAO == "Operante", tipo_ == "auto") |>
-            rlang::set_names("localidades", "nome_estacao", "nome_estado", "situacao",
-                             "latitude","longitude", "altitude", "dt_inicio_operacao",
-                             "cod_estacao","x_","y_", "tipo")
-
-          # --- Função para fazer requisição com fallback de proxy ---
-          pega_dados_inmet <- function(estacao, indicador, data_inicio, data_fim, tentativa = 1) {
-
-            data_inicio <- as.Date(data_inicio) |> format("%Y-%m-%d")
-            data_fim    <- as.Date(data_fim) |> format("%Y-%m-%d")
-
-            # Se ScraperAPI estiver configurado, usa
-            if (nzchar(scraper_key)) {
-              base_url <- "https://api-bndmet.decea.mil.br/v1/estacoes/"
-              params <- paste0(estacao, "/fenomenos/", indicador,
-                               "?dataInicio=", data_inicio, "&dataFinal=", data_fim)
-              final_url <- paste0(
-                "https://api.scraperapi.com/?api_key=", scraper_key,
-                "&url=", URLencode(paste0(base_url, params))
-              )
-            } else {
-              final_url <- paste0(
-                "https://api-bndmet.decea.mil.br/v1/estacoes/",
-                estacao, "/fenomenos/", indicador,
-                "?dataInicio=", data_inicio, "&dataFinal=", data_fim
-              )
-            }
-
-            h <- curl::new_handle()
-            curl::handle_setheaders(
-              h,
-              "accept" = "application/json",
-              "x-api-key" = apikey,
-              "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-              "Accept-Language" = "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-              "Cache-Control" = "no-cache"
-            )
-            curl::handle_setopt(h, connecttimeout = 45, timeout = 60, followlocation = TRUE, ssl_verifypeer = FALSE)
-
-            resposta <- tryCatch(
-              curl::curl_fetch_memory(url = final_url, handle = h),
-              error = function(e) {
-                message("Erro na requisição: ", e$message)
-                list(status_code = 999, content = charToRaw(e$message))
-              }
-            )
-
-            # Se erro de timeout/conexão e estamos usando proxy público, buscar novo proxy
-            if (resposta$status_code == 999 && !nzchar(scraper_key) && tentativa <= 3) {
-              message("Proxy falhou. Buscando novo proxy...")
-              new_proxy <- find_working_proxy(apikey)
-              if (!is.null(new_proxy)) {
-                message("Novo proxy selecionado: ", new_proxy)
-                Sys.setenv(http_proxy = paste0("http://", new_proxy))
-                Sys.setenv(https_proxy = paste0("http://", new_proxy))
-                # Tenta novamente com o novo proxy
-                return(pega_dados_inmet(estacao, indicador, data_inicio, data_fim, tentativa + 1))
-              } else {
-                message("Nenhum novo proxy encontrado. Tentando direto...")
-                Sys.unsetenv("http_proxy")
-                Sys.unsetenv("https_proxy")
-                return(pega_dados_inmet(estacao, indicador, data_inicio, data_fim, tentativa + 1))
-              }
-            }
-
-            if (resposta$status_code %in% c(403, 429, 500) && tentativa <= 3) {
-              message("Erro ", resposta$status_code, " para ", estacao, ". Tentativa ", tentativa, " de 3. Aguardando 10s...")
-              Sys.sleep(10)
-              return(pega_dados_inmet(estacao, indicador, data_inicio, data_fim, tentativa + 1))
-            }
-
-            if (resposta$status_code != 200) {
-              err_msg <- rawToChar(resposta$content)
-              stop(paste0("Erro HTTP ", resposta$status_code, "\n", substr(err_msg, 1, 500)))
-            }
-
-            # Processa a resposta JSON com name_repair para evitar warnings
-            json_content <- resposta$content |> rawToChar()
-            parsed <- tryCatch(
-              jsonlite::fromJSON(json_content, simplifyDataFrame = TRUE),
-              error = function(e) {
-                message("Erro ao parsear JSON: ", e$message)
-                return(NULL)
-              }
-            )
-
-            if (is.null(parsed)) {
-              stop("Resposta não é JSON válido.")
-            }
-
-            resposta_c <- parsed |>
-              purrr::pluck("data", "data") |>
-              tibble::as_tibble(.name_repair = "unique") |>
-              dplyr::mutate(estacao = estacao)
-
-            if (nrow(resposta_c) == 0) {
-              tibble::tibble(
-                nome_estado = NA, cod_estacao = estacao, nome_estacao = NA,
-                longitude = NA, latitude = NA, indicador = NA,
-                dia = as.Date(NA), tempo = as.POSIXct(NA), valor = NA, V1 = NA
-              )
-            } else {
-              dplyr::left_join(resposta_c, estacoes, by = c("estacao" = "cod_estacao")) |>
-                dplyr::mutate(
-                  tempo = as.POSIXct(V1 / 1000, origin = "1970-01-01", tz = "America/Sao_Paulo"),
-                  dia = as.Date(tempo),
-                  cod_estacao = estacao,
-                  indicador = indicador,
-                  valor = V2
-                ) |>
-                dplyr::select(nome_estado, cod_estacao, nome_estacao, longitude, latitude,
-                              indicador, dia, tempo, valor, V1)
-            }
-          }
-
-          # --- Execução com delay ---
-          estacoes_lista <- estacoes$cod_estacao
-          resultados <- list()
-          for (i in seq_along(estacoes_lista)) {
-            est <- estacoes_lista[i]
-            message("Processando ", i, "/", length(estacoes_lista), ": ", est)
-            resultados[[i]] <- pega_dados_inmet(est, "I101", Sys.Date() - 15, Sys.Date() - 1)
-            if (i < length(estacoes_lista)) Sys.sleep(1)
-          }
-
-          base_temp <- dplyr::bind_rows(resultados)
-          vroom::vroom_write(base_temp, file = "base_temp.csv", delim = ";")
-          EOF
-
-          Rscript script.R
+          Rscript pacmanp_load(httr, tidyverse, jsonlite, vroom,.txt  # ou o nome real do arquivo
+          # Se o arquivo tiver outro nome, ajuste o comando acima, ex: Rscript script.R
 
       - name: Configurar usuário git
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Commit e push
+      - name: Commit e push das alterações
         if: success()
         run: |
           git add base_temp.csv
+          # Verifica se houve mudanças antes de commitar
           if git diff --staged --quiet; then
-            echo "Nenhuma alteração."
+            echo "Nenhuma alteração no arquivo CSV."
           else
-            git commit -m "Atualização automática dos dados [skip ci]"
+            git commit -m "Atualização automática dos dados meteorológicos [skip ci]"
             git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${{ github.ref }}
           fi
