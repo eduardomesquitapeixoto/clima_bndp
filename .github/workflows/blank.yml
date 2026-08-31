@@ -3,7 +3,7 @@ name: Atualizar dados meteorológicos (via proxy BR)
 
 on:
   schedule:
-    - cron: '0 10 * * *'          # todos os dias às 10:00 UTC
+    - cron: '0 10 * * *'
   workflow_dispatch:
 
 jobs:
@@ -25,66 +25,63 @@ jobs:
       - name: Instalar dependências do sistema
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev \
-                                  curl jq netcat-openbsd
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev curl
 
       - name: Instalar pacotes R
         run: |
           Rscript -e "install.packages('pacman', repos = 'https://cloud.r-project.org')"
           Rscript -e "pacman::p_load(httr, tidyverse, jsonlite, vroom, usethis, logger, curl, rlang, purrr, dplyr, tidyr, readr, tibble)"
 
-      - name: Obter proxy brasileiro gratuito
-        id: get_proxy
+      - name: Buscar proxy brasileiro (se disponível)
+        id: proxy
         run: |
-          # Baixa lista de proxies HTTP/HTTPS do Brasil (fonte: proxyscrape)
+          # Baixa lista de proxies HTTP do Brasil
           curl -s "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&country=BR&timeout=10000" > proxies_br.txt
-          
-          # Testa cada proxy até encontrar um que responda
+
+          # Fallback para outra fonte se a primeira estiver vazia
+          if [ ! -s proxies_br.txt ]; then
+            curl -s "https://www.proxy-list.download/api/v1/get?type=http&country=BR" > proxies_br.txt
+          fi
+
           PROXY=""
           while IFS= read -r proxy; do
             echo "Testando $proxy..."
-            # Testa conectividade e tempo de resposta (máx 5s)
-            if nc -zv -w 5 $(echo $proxy | cut -d: -f1) $(echo $proxy | cut -d: -f2) 2>/dev/null; then
+            # Testa com curl e timeout curto
+            if curl -s -x "http://$proxy" --max-time 5 "http://httpbin.org/ip" > /dev/null; then
               PROXY="$proxy"
-              echo "Proxy funcionando: $PROXY"
+              echo "Proxy válido encontrado: $PROXY"
               break
             fi
           done < proxies_br.txt
-          
-          if [ -z "$PROXY" ]; then
-            echo "Nenhum proxy BR encontrado. Usando fallback (proxy público genérico)."
-            PROXY="br-proxy.example.com:8080"  # fallback opcional
-          fi
-          
-          # Exporta para variáveis de ambiente do workflow
-          echo "PROXY_HTTP=http://$PROXY" >> $GITHUB_ENV
-          echo "PROXY_HTTPS=http://$PROXY" >> $GITHUB_ENV
-          echo "PROXY_SOCKS=socks5://$PROXY" >> $GITHUB_ENV  # se necessário
 
-      - name: Criar e executar script R (com proxy configurado)
+          # Exporta para o ambiente se encontrou
+          if [ -n "$PROXY" ]; then
+            echo "PROXY_URL=http://$PROXY" >> $GITHUB_ENV
+            echo "Usando proxy: $PROXY"
+          else
+            echo "Nenhum proxy BR funcional. Conexão direta será usada."
+            # Não define PROXY_URL, fica vazio
+          fi
+
+      - name: Criar e executar script R
         env:
-          # Use um secret para a chave (recomendado)
           # BNDMET_API_KEY: ${{ secrets.BNDMET_API_KEY }}
           TZ: America/Sao_Paulo
-          # As variáveis de proxy serão herdadas do step anterior
         run: |
           cat << 'EOF' > script.R
           pacman::p_load(httr, tidyverse, jsonlite, vroom, usethis, logger, curl)
 
-          # Lê variáveis de ambiente do proxy (definidas no workflow)
-          proxy_http <- Sys.getenv("PROXY_HTTP", NA)
-          proxy_https <- Sys.getenv("PROXY_HTTPS", NA)
-
-          # Configura proxy global para o pacote httr
-          if (!is.na(proxy_http)) {
-            Sys.setenv(http_proxy = proxy_http)
-            Sys.setenv(https_proxy = proxy_https)
-            message("Usando proxy: ", proxy_http)
+          # Configura proxy SOMENTE SE a variável PROXY_URL estiver definida e não vazia
+          proxy_url <- Sys.getenv("PROXY_URL")
+          if (nzchar(proxy_url)) {
+            Sys.setenv(http_proxy = proxy_url)
+            Sys.setenv(https_proxy = proxy_url)
+            message("Usando proxy: ", proxy_url)
           } else {
-            message("Nenhum proxy definido, usando conexão direta.")
+            message("Conexão direta (sem proxy).")
           }
 
-          # --- Dados do CSV embutido (mesmo conteúdo anterior) ---
+          # CSV embutido
           estacoes_csv <- "localidades2,DC_NOME,SG_ESTADO,CD_SITUACAO,VL_LATITUDE,VL_LONGITUDE,VL_ALTITUDE,DT_INICIO_OPERACAO,CD_ESTACAO,x_,y_,tipo_
           ANGRA DOS,ANGRA DOS REIS,RJ,Operante,-22.97555554,-44.30333333,6,24/08/2017,A628,571409.545,7459016.760,auto
           ARRAIAL D,ARRAIAL DO CABO,RJ,Operante,-22.97527777,-42.02138888,5,21/09/2006,A606,805404.484,7456116.417,auto
@@ -145,7 +142,6 @@ jobs:
               "&dataFinal=", data_fim
             )
 
-            # Usa o proxy configurado via variáveis de ambiente
             h <- curl::new_handle()
             curl::handle_setheaders(
               h,
@@ -154,7 +150,6 @@ jobs:
             )
             curl::handle_setopt(h, connecttimeout = 600)
 
-            # Se houver proxy, o curl respeita as variáveis http_proxy/https_proxy
             resposta <- curl::curl_fetch_memory(url = requisicao, handle = h)
 
             if (resposta$status_code != 200) {
@@ -235,7 +230,6 @@ jobs:
           )
           EOF
 
-          # Executa o script com as variáveis de proxy já no ambiente
           Rscript script.R
 
       - name: Configurar usuário git
