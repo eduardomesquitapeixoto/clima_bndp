@@ -1,0 +1,175 @@
+# .github/workflows/atualizar_dados.yml
+name: Atualizar dados meteorológicos
+
+on:
+  # Agendamento diário (10:00 UTC)
+  schedule:
+    - cron: '0 10 * * *'
+  # Permite disparo manual
+  workflow_dispatch:
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configurar R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.4.1'
+          use-public-rspm: true
+
+      - name: Instalar dependências do sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+
+      - name: Instalar pacotes R
+        run: |
+          Rscript -e "install.packages('pacman', repos = 'https://cloud.r-project.org')"
+          Rscript -e "pacman::p_load(httr, tidyverse, jsonlite, vroom, usethis, logger, curl, rlang, purrr, dplyr, tidyr, readr, tibble)"
+
+      - name: Criar e executar script R
+        env:
+          # Descomente a linha abaixo se quiser usar um secret em vez da chave fixa
+          # BNDMET_API_KEY: ${{ secrets.BNDMET_API_KEY }}
+          TZ: America/Sao_Paulo
+        run: |
+          # Cria o arquivo script.R com todo o código
+          cat << 'EOF' > script.R
+          pacman::p_load(httr, tidyverse, jsonlite, vroom, usethis, logger)
+
+          estacoes <- readr::read_delim("estacoes_rj.csv", delim = ",") |>
+            dplyr::filter(CD_SITUACAO == "Operante", tipo_ == "auto") |>
+            rlang::set_names("localidades", "nome_estacao", "nome_estado", "situacao",
+                             "latitude","longitude", "altitude", "dt_inicio_operacao",
+                             "cod_estacao","x_","y_", "tipo")
+
+          pega_dados_inmet <- function(estacao, indicador, data_inicio, data_fim) {
+
+            data_inicio <- as.Date(data_inicio) |> format("%Y-%m-%d")
+            data_fim    <- as.Date(data_fim) |> format("%Y-%m-%d")
+
+            # Usa variável de ambiente se definida, senão usa a chave fixa
+            apikey <- Sys.getenv("BNDMET_API_KEY", "1hS5CJHPSCOCSh4W5b57aZHqBBjmSuDy")
+
+            requisicao <- paste0(
+              "https://api-bndmet.decea.mil.br/v1/estacoes/",
+              estacao,
+              "/fenomenos/",
+              indicador,
+              "?dataInicio=", data_inicio,
+              "&dataFinal=", data_fim
+            )
+
+            h <- curl::new_handle()
+            curl::handle_setheaders(
+              h,
+              "accept" = "application/json",
+              "x-api-key" = apikey
+            )
+            curl::handle_setopt(h, connecttimeout = 600)
+
+            resposta <- curl::curl_fetch_memory(url = requisicao, handle = h)
+
+            if (resposta$status_code != 200) {
+              stop(
+                paste0(
+                  "Erro na API BNDMET. HTTP ",
+                  resposta$status_code,
+                  "\n",
+                  rawToChar(resposta$content)
+                )
+              )
+            }
+
+            resposta_c <- resposta$content |>
+              rawToChar() |>
+              jsonlite::fromJSON(simplifyDataFrame = TRUE) |>
+              purrr::pluck("data", "data") |>
+              tibble::as_tibble() |>
+              dplyr::mutate(estacao = estacao)
+
+            if (nrow(resposta_c) == 0) {
+              tibble::tibble(
+                nome_estado = NA,
+                cod_estacao = estacao,
+                nome_estacao = NA,
+                longitude = NA,
+                latitude = NA,
+                indicador = NA,
+                dia = as.Date(NA),
+                tempo = as.POSIXct(NA),
+                valor = NA,
+                V1 = NA
+              )
+            } else {
+              dplyr::left_join(
+                resposta_c,
+                estacoes,
+                by = c("estacao" = "cod_estacao")
+              ) |>
+                dplyr::mutate(
+                  tempo = as.POSIXct(V1 / 1000, origin = "1970-01-01", tz = "America/Sao_Paulo"),
+                  dia = as.Date(tempo),
+                  cod_estacao = estacao,
+                  indicador = indicador,
+                  valor = V2
+                ) |>
+                dplyr::select(
+                  nome_estado,
+                  cod_estacao,
+                  nome_estacao,
+                  longitude,
+                  latitude,
+                  indicador,
+                  dia,
+                  tempo,
+                  valor,
+                  V1
+                )
+            }
+          }
+
+          base_temp <- purrr::pmap(
+            tidyr::expand_grid(
+              estacao = estacoes$cod_estacao,
+              indicador = "I101",
+              data_inicio = Sys.Date() - 15,
+              data_fim = Sys.Date() - 1
+            ),
+            pega_dados_inmet,
+            .progress = TRUE
+          ) |>
+            dplyr::bind_rows()
+
+          vroom::vroom_write(
+            base_temp,
+            file = "base_temp.csv",
+            delim = ";"
+          )
+          EOF
+
+          # Executa o script
+          Rscript script.R
+
+      - name: Configurar usuário git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit e push das alterações
+        if: success()
+        run: |
+          git add base_temp.csv
+          if git diff --staged --quiet; then
+            echo "Nenhuma alteração no arquivo CSV."
+          else
+            git commit -m "Atualização automática dos dados meteorológicos [skip ci]"
+            git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${{ github.ref }}
+          fi
