@@ -55,7 +55,6 @@ jobs:
                 resp <- curl::curl_fetch_memory(url, handle = curl::new_handle(connecttimeout = 10))
                 if (resp$status_code == 200) {
                   text <- rawToChar(resp$content)
-                  # Extrai IP:PORT
                   matches <- gregexpr("([0-9]{1,3}\\.){3}[0-9]{1,3}:[0-9]+", text)
                   ips <- regmatches(text, matches)[[1]]
                   proxies <- c(proxies, ips)
@@ -66,7 +65,7 @@ jobs:
           }
 
           # --- Função para testar um proxy com a API BNDMET ---
-          test_proxy <- function(proxy, api_key, timeout = 30) {
+          test_proxy <- function(proxy, api_key, timeout = 15) {
             test_url <- "https://api-bndmet.decea.mil.br/v1/estacoes/A628/fenomenos/I101?dataInicio=2026-08-01&dataFinal=2026-08-15"
             h <- curl::new_handle()
             curl::handle_setheaders(h,
@@ -74,7 +73,9 @@ jobs:
               "x-api-key" = api_key,
               "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             )
-            curl::handle_setopt(h, connecttimeout = timeout, timeout = timeout, proxy = proxy, proxytype = "http")
+            # proxytype = 0 significa CURLPROXY_HTTP (valor numérico)
+            curl::handle_setopt(h, connecttimeout = timeout, timeout = timeout,
+                                proxy = proxy, proxytype = 0)
             tryCatch({
               resp <- curl::curl_fetch_memory(test_url, handle = h)
               if (resp$status_code == 200) {
@@ -83,22 +84,24 @@ jobs:
                 return(FALSE)
               }
             }, error = function(e) {
-              message("Proxy ", proxy, " falhou: ", e$message)
+              # message("Proxy ", proxy, " falhou: ", e$message)
               return(FALSE)
             })
           }
 
-          # --- Busca um proxy funcional ---
+          # --- Busca um proxy funcional (limite de 100 testes) ---
           find_working_proxy <- function(api_key) {
             proxies <- get_proxy_list()
             if (length(proxies) == 0) {
               message("Nenhum proxy encontrado nas listas.")
               return(NULL)
             }
-            message("Testando ", length(proxies), " proxies...")
-            for (proxy in proxies) {
+            message("Testando até 100 proxies de um total de ", length(proxies), "...")
+            # Limita a 100 para não demorar muito
+            proxies_to_test <- head(proxies, 250)
+            for (proxy in proxies_to_test) {
               message("Testando proxy: ", proxy)
-              if (test_proxy(proxy, api_key, timeout = 30)) {
+              if (test_proxy(proxy, api_key, timeout = 15)) {
                 message("Proxy válido: ", proxy)
                 return(proxy)
               }
@@ -118,6 +121,7 @@ jobs:
             proxy <- find_working_proxy(apikey)
             if (!is.null(proxy)) {
               message("Proxy selecionado: ", proxy)
+              # Configura proxy para todas as chamadas via variáveis de ambiente
               Sys.setenv(http_proxy = paste0("http://", proxy))
               Sys.setenv(https_proxy = paste0("http://", proxy))
             } else {
@@ -170,7 +174,7 @@ jobs:
                              "latitude","longitude", "altitude", "dt_inicio_operacao",
                              "cod_estacao","x_","y_", "tipo")
 
-          # --- Função principal de requisição com proxy (ou ScraperAPI) ---
+          # --- Função principal de requisição com proxy (via variáveis de ambiente) ---
           pega_dados_inmet <- function(estacao, indicador, data_inicio, data_fim, tentativa = 1) {
 
             data_inicio <- as.Date(data_inicio) |> format("%Y-%m-%d")
@@ -202,6 +206,7 @@ jobs:
               "Accept-Language" = "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
               "Cache-Control" = "no-cache"
             )
+            # Usa timeout de 30s para conexão e 60s total
             curl::handle_setopt(h, connecttimeout = 30, timeout = 60, followlocation = TRUE, ssl_verifypeer = FALSE)
 
             resposta <- tryCatch(
