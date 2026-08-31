@@ -1,5 +1,5 @@
 # .github/workflows/atualizar_dados.yml
-name: Atualizar dados meteorológicos (via proxy BR)
+name: Atualizar dados meteorológicos (via proxy)
 
 on:
   schedule:
@@ -32,65 +32,62 @@ jobs:
           Rscript -e "install.packages('pacman', repos = 'https://cloud.r-project.org')"
           Rscript -e "pacman::p_load(httr, tidyverse, jsonlite, vroom, usethis, logger, curl, rlang, purrr, dplyr, tidyr, readr, tibble)"
 
-      - name: Buscar proxy brasileiro funcional (múltiplas fontes)
+      - name: Buscar proxy brasileiro (público)
         id: proxy
         run: |
-          # Lista de fontes de proxies HTTP/HTTPS
+          # Lista de fontes confiáveis de proxies HTTP/HTTPS
           SOURCES=(
-            "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&country=BR&timeout=10000"
+            "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&country=BR&timeout=5000"
             "https://www.proxy-list.download/api/v1/get?type=http&country=BR"
             "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"
             "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt"
+            "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt"
           )
 
           PROXY_LIST="/tmp/proxies.txt"
           > "$PROXY_LIST"
 
           for url in "${SOURCES[@]}"; do
-            echo "Baixando de $url"
-            curl -s "$url" >> "$PROXY_LIST"
+            echo "Baixando lista de $url"
+            curl -s --max-time 10 "$url" >> "$PROXY_LIST"
             echo "" >> "$PROXY_LIST"
           done
 
-          # Filtra apenas proxies com IP do Brasil (muitos podem ser de outros países, mas vamos testar)
-          grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$' "$PROXY_LIST" | sort -u > /tmp/proxies_clean.txt
+          # Filtra apenas IP:PORT
+          grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+' "$PROXY_LIST" | sort -u > /tmp/proxies_filtered.txt
 
           PROXY=""
           # Testa até 20 proxies
-          head -20 /tmp/proxies_clean.txt | while IFS= read -r proxy; do
-            echo "Testando $proxy..."
-            # Testa com curl para httpbin e verifica se retorna IP BR (via whois ou geolocalização)
+          while IFS= read -r proxy; do
+            echo "Testando proxy: $proxy"
+            # Testa conectividade e obtém IP de saída
             IP=$(curl -s -x "http://$proxy" --max-time 5 "http://httpbin.org/ip" 2>/dev/null | jq -r .origin)
             if [ -n "$IP" ]; then
-              # Verifica se o IP é do Brasil (apenas teste simples: consulta geolocalização)
+              # Verifica o país via ip-api.com
               COUNTRY=$(curl -s "http://ip-api.com/json/$IP?fields=countryCode" | jq -r .countryCode)
-              if [ "$COUNTRY" == "BR" ]; then
+              if [ "$COUNTRY" = "BR" ]; then
                 PROXY="$proxy"
-                echo "Proxy BR válido encontrado: $PROXY (IP $IP)"
+                echo "Proxy BR válido: $PROXY (IP $IP)"
                 break
-              else
-                echo "Proxy $proxy retornou IP $IP (não é BR)"
               fi
             fi
-          done
+          done < /tmp/proxies_filtered.txt
 
           if [ -n "$PROXY" ]; then
             echo "PROXY_URL=http://$PROXY" >> $GITHUB_ENV
-            echo "Usando proxy: $PROXY"
+            echo "Usando proxy público: $PROXY"
           else
-            echo "Nenhum proxy BR funcional. Tentando ScraperAPI como fallback..."
-            # Fallback: ScraperAPI (gratuito até 1000 req/mês) – precisa de chave
-            # Se você tiver uma chave, defina como secret SCRAPERAPI_KEY
-            SCRAPER_KEY="${{ secrets.SCRAPERAPI_KEY }}"
-            if [ -n "$SCRAPER_KEY" ]; then
-              echo "SCRAPERAPI_KEY=$SCRAPER_KEY" >> $GITHUB_ENV
-              echo "Usando ScraperAPI como proxy."
+            echo "Nenhum proxy BR público encontrado."
+            # Fallback: usar ScraperAPI se a chave estiver disponível
+            if [ -n "${{ secrets.SCRAPERAPI_KEY }}" ]; then
+              echo "SCRAPERAPI_KEY=${{ secrets.SCRAPERAPI_KEY }}" >> $GITHUB_ENV
+              echo "Usando ScraperAPI como fallback."
             else
-              echo "Sem proxy alternativo. Conexão direta será usada (pode falhar)."
+              echo "Sem proxy. A execução provavelmente falhará (IP bloqueado)."
             fi
           fi
 
-      - name: Criar e executar script R (com proxy e headers)
+      - name: Criar e executar script R (com proxy e retry)
         env:
           # BNDMET_API_KEY: ${{ secrets.BNDMET_API_KEY }}
           TZ: America/Sao_Paulo
@@ -98,23 +95,21 @@ jobs:
           cat << 'EOF' > script.R
           pacman::p_load(httr, tidyverse, jsonlite, vroom, usethis, logger, curl)
 
-          # --- Configuração de proxy (se disponível) ---
+          # --- Configuração de proxy ---
           proxy_url <- Sys.getenv("PROXY_URL")
           scraper_key <- Sys.getenv("SCRAPERAPI_KEY")
 
           if (nzchar(proxy_url)) {
             Sys.setenv(http_proxy = proxy_url)
             Sys.setenv(https_proxy = proxy_url)
-            message("Usando proxy HTTP: ", proxy_url)
+            message("Usando proxy público: ", proxy_url)
           } else if (nzchar(scraper_key)) {
-            # ScraperAPI atua como proxy via URL
             message("Usando ScraperAPI como proxy.")
-            # A variável será usada na construção da URL
           } else {
-            message("Conexão direta (sem proxy).")
+            message("Conexão direta (sem proxy). Pode falhar por bloqueio.")
           }
 
-          # --- CSV embutido (mesmo conteúdo) ---
+          # --- CSV embutido (completo) ---
           estacoes_csv <- "localidades2,DC_NOME,SG_ESTADO,CD_SITUACAO,VL_LATITUDE,VL_LONGITUDE,VL_ALTITUDE,DT_INICIO_OPERACAO,CD_ESTACAO,x_,y_,tipo_
           ANGRA DOS,ANGRA DOS REIS,RJ,Operante,-22.97555554,-44.30333333,6,24/08/2017,A628,571409.545,7459016.760,auto
           ARRAIAL D,ARRAIAL DO CABO,RJ,Operante,-22.97527777,-42.02138888,5,21/09/2006,A606,805404.484,7456116.417,auto
@@ -159,35 +154,32 @@ jobs:
                              "latitude","longitude", "altitude", "dt_inicio_operacao",
                              "cod_estacao","x_","y_", "tipo")
 
-          # Função que faz a requisição com proxy e headers realistas
-          pega_dados_inmet <- function(estacao, indicador, data_inicio, data_fim) {
+          # Função com retry e delay
+          pega_dados_inmet <- function(estacao, indicador, data_inicio, data_fim, tentativa = 1) {
 
             data_inicio <- as.Date(data_inicio) |> format("%Y-%m-%d")
             data_fim    <- as.Date(data_fim) |> format("%Y-%m-%d")
 
             apikey <- Sys.getenv("BNDMET_API_KEY", "1hS5CJHPSCOCSh4W5b57aZHqBBjmSuDy")
 
-            # URL base
-            base_url <- "https://api-bndmet.decea.mil.br/v1/estacoes/"
             # Se estiver usando ScraperAPI, modifica a URL
             scraper_key <- Sys.getenv("SCRAPERAPI_KEY")
             if (nzchar(scraper_key)) {
-              # ScraperAPI atua como proxy com prefixo
+              base_url <- "https://api-bndmet.decea.mil.br/v1/estacoes/"
+              params <- paste0(estacao, "/fenomenos/", indicador,
+                               "?dataInicio=", data_inicio, "&dataFinal=", data_fim)
               final_url <- paste0(
                 "https://api.scraperapi.com/?api_key=", scraper_key,
-                "&url=", URLencode(
-                  paste0(base_url, estacao, "/fenomenos/", indicador,
-                         "?dataInicio=", data_inicio, "&dataFinal=", data_fim)
-                )
+                "&url=", URLencode(paste0(base_url, params))
               )
             } else {
               final_url <- paste0(
-                base_url, estacao, "/fenomenos/", indicador,
+                "https://api-bndmet.decea.mil.br/v1/estacoes/",
+                estacao, "/fenomenos/", indicador,
                 "?dataInicio=", data_inicio, "&dataFinal=", data_fim
               )
             }
 
-            # Configura handle com headers para simular navegador
             h <- curl::new_handle()
             curl::handle_setheaders(
               h,
@@ -204,20 +196,24 @@ jobs:
               connecttimeout = 600,
               timeout = 600,
               followlocation = TRUE,
-              ssl_verifypeer = FALSE  # apenas para evitar erros de certificado
+              ssl_verifypeer = FALSE
             )
 
             resposta <- curl::curl_fetch_memory(url = final_url, handle = h)
 
+            # Se erro 403/429 e ainda há tentativas, espera e tenta novamente
+            if (resposta$status_code %in% c(403, 429) && tentativa <= 3) {
+              message("Erro ", resposta$status_code, " para ", estacao, ". Tentativa ", tentativa, " de 3. Aguardando 5s...")
+              Sys.sleep(5)
+              return(pega_dados_inmet(estacao, indicador, data_inicio, data_fim, tentativa + 1))
+            }
+
             if (resposta$status_code != 200) {
-              # Se erro, tenta ler o conteúdo
               err_msg <- rawToChar(resposta$content)
               stop(
                 paste0(
-                  "Erro na API BNDMET. HTTP ",
-                  resposta$status_code,
-                  "\n",
-                  substr(err_msg, 1, 500)  # limita o tamanho
+                  "Erro na API BNDMET. HTTP ", resposta$status_code,
+                  "\n", substr(err_msg, 1, 500)
                 )
               )
             }
@@ -270,17 +266,21 @@ jobs:
             }
           }
 
-          base_temp <- purrr::pmap(
-            tidyr::expand_grid(
-              estacao = estacoes$cod_estacao,
-              indicador = "I101",
-              data_inicio = Sys.Date() - 15,
-              data_fim = Sys.Date() - 1
-            ),
-            pega_dados_inmet,
-            .progress = TRUE
-          ) |>
-            dplyr::bind_rows()
+          # Executa com delay entre as chamadas para evitar rate limit
+          estacoes_lista <- estacoes$cod_estacao
+          resultados <- list()
+
+          for (i in seq_along(estacoes_lista)) {
+            est <- estacoes_lista[i]
+            message("Processando estação ", i, "/", length(estacoes_lista), ": ", est)
+            res <- pega_dados_inmet(est, "I101", Sys.Date() - 15, Sys.Date() - 1)
+            resultados[[i]] <- res
+            if (i < length(estacoes_lista)) {
+              Sys.sleep(0.5)  # pausa de 0,5s entre chamadas
+            }
+          }
+
+          base_temp <- dplyr::bind_rows(resultados)
 
           vroom::vroom_write(
             base_temp,
