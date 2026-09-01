@@ -9,12 +9,14 @@ on:
 jobs:
   update-data:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # essencial para fazer push
 
     steps:
       - name: Checkout do repositório
         uses: actions/checkout@v4
         with:
-          persist-credentials: false
+          persist-credentials: false  # necessário para usar token personalizado
 
       - name: Configurar R
         uses: r-lib/actions/setup-r@v2
@@ -32,7 +34,7 @@ jobs:
           Rscript -e "install.packages('pacman', repos = 'https://cloud.r-project.org')"
           Rscript -e "pacman::p_load(httr, tidyverse, jsonlite, vroom, usethis, logger, curl, rlang, purrr, dplyr, tidyr, readr, tibble)"
 
-      - name: Executar script R (puxando dado bruto)
+      - name: Executar script R (com dados brutos)
         env:
           BNDMET_API_KEY: ${{ secrets.BNDMET_API_KEY || '1hS5CJHPSCOCSh4W5b57aZHqBBjmSuDy' }}
           TZ: America/Sao_Paulo
@@ -125,7 +127,7 @@ jobs:
             }
           }
 
-          # --- CSV embutido (mesmo de antes) ---
+          # --- CSV embutido (completo) ---
           estacoes_csv <- "localidades2,DC_NOME,SG_ESTADO,CD_SITUACAO,VL_LATITUDE,VL_LONGITUDE,VL_ALTITUDE,DT_INICIO_OPERACAO,CD_ESTACAO,x_,y_,tipo_
           ANGRA DOS,ANGRA DOS REIS,RJ,Operante,-22.97555554,-44.30333333,6,24/08/2017,A628,571409.545,7459016.760,auto
           ARRAIAL D,ARRAIAL DO CABO,RJ,Operante,-22.97527777,-42.02138888,5,21/09/2006,A606,805404.484,7456116.417,auto
@@ -170,8 +172,8 @@ jobs:
                              "latitude","longitude", "altitude", "dt_inicio_operacao",
                              "cod_estacao","x_","y_", "tipo")
 
-          # --- Função para pegar dados BRUTOS (sem tratamentos) ---
-          pega_dados_inmet <- function(estacao, indicador, data_inicio, data_fim, tentativa = 1) {
+          # --- Função que retorna os dados BRUTOS (JSON) sem processamento ---
+          pega_dados_brutos <- function(estacao, indicador, data_inicio, data_fim, tentativa = 1) {
 
             data_inicio <- as.Date(data_inicio) |> format("%Y-%m-%d")
             data_fim    <- as.Date(data_fim) |> format("%Y-%m-%d")
@@ -197,7 +199,8 @@ jobs:
               h,
               "accept" = "application/json",
               "x-api-key" = apikey,
-              "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+              "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+              "Accept-Language" = "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
             )
             curl::handle_setopt(h, connecttimeout = 45, timeout = 60, followlocation = TRUE, ssl_verifypeer = FALSE)
 
@@ -213,79 +216,89 @@ jobs:
               message("Proxy falhou. Buscando novo proxy...")
               new_proxy <- find_working_proxy(apikey)
               if (!is.null(new_proxy)) {
+                message("Novo proxy selecionado: ", new_proxy)
                 Sys.setenv(http_proxy = paste0("http://", new_proxy))
                 Sys.setenv(https_proxy = paste0("http://", new_proxy))
-                return(pega_dados_inmet(estacao, indicador, data_inicio, data_fim, tentativa + 1))
+                return(pega_dados_brutos(estacao, indicador, data_inicio, data_fim, tentativa + 1))
               } else {
-                message("Nenhum novo proxy. Tentando sem proxy...")
+                message("Nenhum novo proxy. Tentando direto...")
                 Sys.unsetenv("http_proxy")
                 Sys.unsetenv("https_proxy")
-                return(pega_dados_inmet(estacao, indicador, data_inicio, data_fim, tentativa + 1))
+                return(pega_dados_brutos(estacao, indicador, data_inicio, data_fim, tentativa + 1))
               }
             }
 
             if (resposta$status_code %in% c(403, 429, 500) && tentativa <= 3) {
               message("Erro ", resposta$status_code, " para ", estacao, ". Tentativa ", tentativa, " de 3. Aguardando 10s...")
               Sys.sleep(10)
-              return(pega_dados_inmet(estacao, indicador, data_inicio, data_fim, tentativa + 1))
+              return(pega_dados_brutos(estacao, indicador, data_inicio, data_fim, tentativa + 1))
             }
 
-            if (resposta$status_code != 200) {
-              err_msg <- rawToChar(resposta$content)
-              stop(paste0("Erro HTTP ", resposta$status_code, "\n", substr(err_msg, 1, 500)))
-            }
-
-            # Retorna os dados BRUTOS como JSON (texto) e também tenta extrair a lista de dados
-            json_content <- rawToChar(resposta$content)
-            parsed <- tryCatch(
-              jsonlite::fromJSON(json_content, simplifyDataFrame = FALSE),
-              error = function(e) NULL
+            # Retorna o conteúdo bruto (JSON como texto)
+            conteudo <- rawToChar(resposta$content)
+            list(
+              estacao = estacao,
+              status = resposta$status_code,
+              json = conteudo
             )
-
-            # Data frame base com informações da estação e o JSON bruto
-            base_df <- tibble::tibble(
-              cod_estacao = estacao,
-              indicador = indicador,
-              data_inicio = data_inicio,
-              data_fim = data_fim,
-              json_bruto = json_content
-            )
-
-            if (is.null(parsed)) {
-              # Se não parseou JSON, retorna só o bruto
-              return(base_df)
-            }
-
-            # Tenta extrair a lista de dados (data$data) se existir
-            dados <- parsed$data$data
-            if (is.null(dados) || length(dados) == 0) {
-              # Se não houver dados, retorna só o bruto
-              return(base_df)
-            }
-
-            # Converte a lista para tibble, com repair para colunas duplicadas
-            dados_df <- tryCatch(
-              tibble::as_tibble(dados, .name_repair = "unique"),
-              error = function(e) tibble::tibble(erro_parse = e$message)
-            )
-
-            # Junta com as informações da estação
-            base_df |>
-              dplyr::bind_cols(dados_df)
           }
 
-          # --- Execução ---
+          # --- Execução: busca dados brutos e salva como JSON ---
           estacoes_lista <- estacoes$cod_estacao
-          resultados <- list()
+          todos_jsons <- list()
           for (i in seq_along(estacoes_lista)) {
             est <- estacoes_lista[i]
             message("Processando ", i, "/", length(estacoes_lista), ": ", est)
-            resultados[[i]] <- pega_dados_inmet(est, "I101", Sys.Date() - 15, Sys.Date() - 1)
+            resultado <- pega_dados_brutos(est, "I101", Sys.Date() - 15, Sys.Date() - 1)
+            todos_jsons[[est]] <- resultado
             if (i < length(estacoes_lista)) Sys.sleep(1)
           }
 
-          base_temp <- dplyr::bind_rows(resultados)
-          vroom::vroom_write(base_temp, file = "base_temp.csv", delim = ";")
+          # Salva todos os JSONs brutos em um único arquivo (formato lista)
+          json_final <- jsonlite::toJSON(todos_jsons, auto_unbox = TRUE, pretty = TRUE)
+          writeLines(json_final, "dados_brutos.json")
+
+          # Opcional: também tenta extrair um CSV simplificado com as primeiras colunas (se existirem)
+          # Para não quebrar, vamos tentar parsear cada JSON e extrair os dados de forma genérica
+          # Se falhar, apenas avisa.
+          base_temp <- tryCatch({
+            df_list <- list()
+            for (est in names(todos_jsons)) {
+              item <- todos_jsons[[est]]
+              if (item$status == 200) {
+                parsed <- jsonlite::fromJSON(item$json, simplifyDataFrame = TRUE)
+                dados <- parsed$data$data
+                if (!is.null(dados) && nrow(dados) > 0) {
+                  # Pega as duas primeiras colunas (timestamp e valor) independente do nome
+                  cols <- colnames(dados)
+                  if (length(cols) >= 2) {
+                    df <- data.frame(
+                      estacao = est,
+                      timestamp = dados[[cols[1]]],
+                      valor = dados[[cols[2]]],
+                      stringsAsFactors = FALSE
+                    )
+                    df_list[[est]] <- df
+                  } else {
+                    message("Estação ", est, " retornou dados com menos de 2 colunas. Ignorando.")
+                  }
+                }
+              }
+            }
+            dplyr::bind_rows(df_list)
+          }, error = function(e) {
+            message("Erro ao gerar CSV simplificado: ", e$message)
+            NULL
+          })
+
+          if (!is.null(base_temp) && nrow(base_temp) > 0) {
+            vroom::vroom_write(base_temp, file = "base_temp.csv", delim = ";")
+          } else {
+            # Se não conseguiu extrair, salva um arquivo vazio com aviso
+            writeLines("Nenhum dado válido foi extraído.", "base_temp.csv")
+          }
+
+          message("Arquivo dados_brutos.json salvo com sucesso.")
           EOF
 
           Rscript script.R
@@ -298,10 +311,10 @@ jobs:
       - name: Commit e push
         if: success()
         run: |
-          git add base_temp.csv
+          git add dados_brutos.json base_temp.csv
           if git diff --staged --quiet; then
             echo "Nenhuma alteração."
           else
-            git commit -m "Atualização automática dos dados [skip ci]"
+            git commit -m "Atualização automática dos dados brutos [skip ci]"
             git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${{ github.ref }}
           fi
