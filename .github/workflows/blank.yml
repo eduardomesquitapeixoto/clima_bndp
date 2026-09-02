@@ -3,7 +3,7 @@ name: Atualizar dados meteorológicos (proxy via R)
 
 on:
   schedule:
-    - cron: '0 10 * * *'
+    - cron: '0 5 * * *'
   workflow_dispatch:
 
 jobs:
